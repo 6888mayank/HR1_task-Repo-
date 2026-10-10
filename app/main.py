@@ -10,11 +10,11 @@ from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 import os
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Path, Query
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, model_validator
 import pymongo
 from pymongo import MongoClient, ReturnDocument
 
@@ -233,340 +233,39 @@ class EmployeeCreate(BaseModel):
     joined_on: str = Field(..., pattern=r"^\d{4}-\d{2}-\d{2}$")
 
     @model_validator(mode="after")
-    def validate_shifts(self):
+    def validate_employee(self):
         if self.shift_start == self.shift_end:
             raise ValueError("shift_start must differ from shift_end")
+        try:
+            date.fromisoformat(self.joined_on)
+        except ValueError:
+            raise ValueError("joined_on must be a valid calendar date")
         return self
 
 
 class PunchInRequest(BaseModel):
     emp_code: str
-    punched_at: Optional[int] = Field(None, ge=100000000000, le=4102444800000)
+    punched_at: Optional[int] = Field(None, ge=100000000000, le=4102444800000, strict=True)
     status: str = Field("PRESENT", pattern=r"^(PRESENT|WFH|ON_DUTY)$")
 
 
 class PunchOutRequest(BaseModel):
     emp_code: str
-    punched_at: Optional[int] = Field(None, ge=100000000000, le=4102444800000)
+    punched_at: Optional[int] = Field(None, ge=100000000000, le=4102444800000, strict=True)
 
 
 class RegularizeRequest(BaseModel):
     reason: str = Field(..., min_length=5, max_length=200)
     regularized_by: str = Field(..., min_length=1, max_length=50)
     status: Optional[str] = Field(None, pattern=r"^(PRESENT|ABSENT|LEAVE|WFH|ON_DUTY)$")
-    punch_in: Optional[int] = Field(None, ge=100000000000, le=4102444800000)
-    punch_out: Optional[int] = Field(None, ge=100000000000, le=4102444800000)
+    punch_in: Optional[int] = Field(None, ge=100000000000, le=4102444800000, strict=True)
+    punch_out: Optional[int] = Field(None, ge=100000000000, le=4102444800000, strict=True)
 
 
 # --------------------------------------------------------------------------- #
-# System Endpoints
+# Shared Aggregation Pipeline Builders (DRY for endpoints & explain)
 # --------------------------------------------------------------------------- #
-@app.get("/health")
-def health():
-    try:
-        client.admin.command("ping")
-        return {"status": "ok"}
-    except Exception:
-        raise HTTPException(status_code=503, detail="Database unavailable")
-
-
-# --------------------------------------------------------------------------- #
-# Employee Endpoints
-# --------------------------------------------------------------------------- #
-@app.post("/employees", status_code=201)
-def create_employee(body: EmployeeCreate):
-    now_utc = datetime.now(timezone.utc).replace(microsecond=0)
-    doc = body.model_dump()
-    doc["created_at"] = now_utc
-
-    try:
-        db.employees.insert_one(doc)
-    except pymongo.errors.DuplicateKeyError:
-        raise HTTPException(status_code=409, detail="emp_code already exists")
-
-    return format_employee_doc(doc)
-
-
-@app.get("/employees")
-def list_employees(
-    department: Optional[str] = None,
-    page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1, le=100),
-):
-    q: Dict[str, Any] = {}
-    if department:
-        q["department"] = department
-
-    total = db.employees.count_documents(q)
-    skip = (page - 1) * page_size
-    cursor = db.employees.find(q).sort("emp_code", pymongo.ASCENDING).skip(skip).limit(page_size)
-    items = [format_employee_doc(d) for d in cursor]
-    return {"items": items, "total": total, "page": page, "page_size": page_size}
-
-
-# --------------------------------------------------------------------------- #
-# Attendance Endpoints
-# --------------------------------------------------------------------------- #
-@app.post("/attendance/punch-in", status_code=201)
-def punch_in(body: PunchInRequest):
-    emp = db.employees.find_one({"emp_code": body.emp_code})
-    if not emp:
-        raise HTTPException(status_code=404, detail="Employee not found")
-
-    if body.punched_at is not None:
-        punch_in_utc = ms_to_utc_dt(body.punched_at)
-    else:
-        now_ts = int(datetime.now(timezone.utc).timestamp()) * 1000
-        punch_in_utc = ms_to_utc_dt(now_ts)
-
-    att_date = get_attendance_date(punch_in_utc, emp["shift_start"], emp["shift_end"])
-    late_min = compute_late_minutes(punch_in_utc, emp["shift_start"], att_date)
-
-    doc = {
-        "emp_code": body.emp_code,
-        "date": att_date,
-        "status": body.status,
-        "punch_in": punch_in_utc,
-        "punch_out": None,
-        "work_hours": None,
-        "late_minutes": late_min,
-        "overtime_minutes": 0,
-        "half_day": False,
-        "history": [],
-    }
-
-    try:
-        db.attendance_logs.insert_one(doc)
-    except pymongo.errors.DuplicateKeyError:
-        raise HTTPException(status_code=409, detail="already punched in for this date")
-
-    return format_attendance_doc(doc)
-
-
-@app.post("/attendance/punch-out", status_code=200)
-def punch_out(body: PunchOutRequest):
-    emp = db.employees.find_one({"emp_code": body.emp_code})
-    if not emp:
-        raise HTTPException(status_code=404, detail="Employee not found")
-
-    if body.punched_at is not None:
-        punch_out_utc = ms_to_utc_dt(body.punched_at)
-    else:
-        now_ts = int(datetime.now(timezone.utc).timestamp()) * 1000
-        punch_out_utc = ms_to_utc_dt(now_ts)
-
-    # Find the most recent record whose punch_in <= punch_out
-    open_record = db.attendance_logs.find_one(
-        {"emp_code": body.emp_code, "punch_in": {"$lte": punch_out_utc}},
-        sort=[("punch_in", pymongo.DESCENDING)]
-    )
-
-    if not open_record:
-        raise HTTPException(status_code=404, detail="No punch-in record found")
-
-    if open_record.get("punch_out") is not None:
-        raise HTTPException(status_code=409, detail="Record is already punched out")
-
-    punch_in_utc = open_record["punch_in"]
-    if punch_in_utc.tzinfo is None:
-        punch_in_utc = punch_in_utc.replace(tzinfo=timezone.utc)
-
-    diff_sec = (punch_out_utc - punch_in_utc).total_seconds()
-    if diff_sec <= 0 or diff_sec > 86400:
-        raise HTTPException(status_code=422, detail="punch_out must be strictly after punch_in and within 24 hours")
-
-    work_hours = compute_work_hours(punch_in_utc, punch_out_utc)
-    half_day = bool(work_hours < 4.50)
-    overtime_min = compute_overtime(punch_out_utc, emp["shift_end"], open_record["date"], emp["shift_start"])
-
-    # Atomic update with concurrency check: punch_out must still be None
-    updated = db.attendance_logs.find_one_and_update(
-        {
-            "_id": open_record["_id"],
-            "punch_out": None
-        },
-        {
-            "$set": {
-                "punch_out": punch_out_utc,
-                "work_hours": work_hours,
-                "overtime_minutes": overtime_min,
-                "half_day": half_day,
-            }
-        },
-        return_document=ReturnDocument.AFTER
-    )
-
-    if not updated:
-        raise HTTPException(status_code=409, detail="Record was concurrently punched out")
-
-    return format_attendance_doc(updated)
-
-
-@app.get("/attendance")
-def list_attendance(
-    emp_code: Optional[str] = None,
-    date_from: Optional[str] = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
-    date_to: Optional[str] = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
-    status: Optional[str] = Query(None, pattern=r"^(PRESENT|ABSENT|LEAVE|WFH|ON_DUTY)$"),
-    page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1, le=100),
-):
-    if date_from and date_to and date_from > date_to:
-        raise HTTPException(status_code=422, detail="date_from must be <= date_to")
-
-    q: Dict[str, Any] = {}
-    if emp_code:
-        q["emp_code"] = emp_code
-    if date_from or date_to:
-        q["date"] = {}
-        if date_from:
-            q["date"]["$gte"] = date_from
-        if date_to:
-            q["date"]["$lte"] = date_to
-    if status:
-        q["status"] = status
-
-    total = db.attendance_logs.count_documents(q)
-    skip = (page - 1) * page_size
-    cursor = db.attendance_logs.find(q).sort([("date", pymongo.DESCENDING), ("emp_code", pymongo.ASCENDING)]).skip(skip).limit(page_size)
-    items = [format_attendance_doc(d) for d in cursor]
-    return {"items": items, "total": total, "page": page, "page_size": page_size}
-
-
-@app.patch("/attendance/{emp_code}/{date}")
-def regularize_attendance(
-    emp_code: str = Path(...),
-    date: str = Path(..., pattern=r"^\d{4}-\d{2}-\d{2}$"),
-    body: RegularizeRequest = ...,
-):
-    emp = db.employees.find_one({"emp_code": emp_code})
-    if not emp:
-        raise HTTPException(status_code=404, detail="Employee not found")
-
-    record = db.attendance_logs.find_one({"emp_code": emp_code, "date": date})
-    if not record:
-        raise HTTPException(status_code=404, detail="Attendance record not found")
-
-    curr_status = record.get("status")
-    curr_in = record.get("punch_in")
-    if curr_in and curr_in.tzinfo is None:
-        curr_in = curr_in.replace(tzinfo=timezone.utc)
-    curr_out = record.get("punch_out")
-    if curr_out and curr_out.tzinfo is None:
-        curr_out = curr_out.replace(tzinfo=timezone.utc)
-    curr_wh = record.get("work_hours")
-    curr_late = record.get("late_minutes", 0)
-    curr_ot = record.get("overtime_minutes", 0)
-    curr_hd = record.get("half_day", False)
-    curr_history = record.get("history") or []
-
-    target_status = body.status if body.status is not None else curr_status
-
-    if target_status in ("ABSENT", "LEAVE"):
-        if body.punch_in is not None or body.punch_out is not None:
-            raise HTTPException(status_code=422, detail="Cannot supply punch times when setting ABSENT or LEAVE")
-        new_in = None
-        new_out = None
-        new_wh = None
-        new_late = 0
-        new_ot = 0
-        new_hd = False
-    else:
-        # Presence status requires punch_in
-        if body.punch_in is not None:
-            new_in = ms_to_utc_dt(body.punch_in)
-        else:
-            new_in = curr_in
-
-        if new_in is None:
-            raise HTTPException(status_code=422, detail="Presence status requires punch_in")
-
-        # R1: punch_in must stay on record's attendance date
-        computed_date = get_attendance_date(new_in, emp["shift_start"], emp["shift_end"])
-        if computed_date != date:
-            raise HTTPException(status_code=422, detail="punch_in does not match the attendance date")
-
-        # punch_out
-        if body.punch_out is not None:
-            new_out = ms_to_utc_dt(body.punch_out)
-        else:
-            new_out = curr_out
-
-        if new_out is not None:
-            diff_sec = (new_out - new_in).total_seconds()
-            if diff_sec <= 0 or diff_sec > 86400:
-                raise HTTPException(status_code=422, detail="punch_out must be after punch_in and within 24 hours")
-            new_wh = compute_work_hours(new_in, new_out)
-            new_hd = bool(new_wh < 4.50)
-            new_ot = compute_overtime(new_out, emp["shift_end"], date, emp["shift_start"])
-        else:
-            new_wh = None
-            new_hd = False
-            new_ot = 0
-
-        new_late = compute_late_minutes(new_in, emp["shift_start"], date)
-
-    # Compute changes
-    changes: Dict[str, Any] = {}
-    if target_status != curr_status:
-        changes["status"] = {"from": curr_status, "to": target_status}
-    if new_in != curr_in:
-        changes["punch_in"] = {"from": curr_in, "to": new_in}
-    if new_out != curr_out:
-        changes["punch_out"] = {"from": curr_out, "to": new_out}
-    if new_wh != curr_wh:
-        changes["work_hours"] = {"from": curr_wh, "to": new_wh}
-    if new_late != curr_late:
-        changes["late_minutes"] = {"from": curr_late, "to": new_late}
-    if new_ot != curr_ot:
-        changes["overtime_minutes"] = {"from": curr_ot, "to": new_ot}
-    if new_hd != curr_hd:
-        changes["half_day"] = {"from": curr_hd, "to": new_hd}
-
-    if not changes:
-        raise HTTPException(status_code=422, detail="No fields changed")
-
-    now_utc = datetime.now(timezone.utc).replace(microsecond=0)
-    history_entry = {
-        "at": now_utc,
-        "by": body.regularized_by,
-        "reason": body.reason,
-        "changes": changes,
-    }
-
-    # Race-safe update matching exact current history size
-    updated = db.attendance_logs.find_one_and_update(
-        {
-            "_id": record["_id"],
-            "history": {"$size": len(curr_history)}
-        },
-        {
-            "$set": {
-                "status": target_status,
-                "punch_in": new_in,
-                "punch_out": new_out,
-                "work_hours": new_wh,
-                "late_minutes": new_late,
-                "overtime_minutes": new_ot,
-                "half_day": new_hd,
-            },
-            "$push": {
-                "history": history_entry
-            }
-        },
-        return_document=ReturnDocument.AFTER
-    )
-
-    if not updated:
-        raise HTTPException(status_code=409, detail="Concurrent regularization conflict")
-
-    return format_attendance_doc(updated)
-
-
-# --------------------------------------------------------------------------- #
-# Analytics Endpoints
-# --------------------------------------------------------------------------- #
-def get_month_range(month_str: str) -> tuple[str, str, int]:
+def get_month_range(month_str: str) -> Tuple[str, str, int]:
     """Return (first_day, last_day, days_in_month)."""
     year, month = map(int, month_str.split("-"))
     days_in_month = calendar.monthrange(year, month)[1]
@@ -590,22 +289,8 @@ def count_working_days(start_date_str: str, end_date_str: str) -> int:
     return cnt
 
 
-@app.get("/analytics/employees/{emp_code}/monthly")
-def employee_monthly(
-    emp_code: str = Path(...),
-    month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
-):
-    emp = db.employees.find_one({"emp_code": emp_code})
-    if not emp:
-        raise HTTPException(status_code=404, detail="Employee not found")
-
+def build_employee_monthly_pipeline(emp_code: str, month: str) -> Tuple[str, List[Dict[str, Any]]]:
     first_day, last_day, _ = get_month_range(month)
-    joined_on = emp["joined_on"]
-
-    # Working days per R7
-    eff_start = max(first_day, joined_on)
-    working_days = count_working_days(eff_start, last_day)
-
     pipeline = [
         {
             "$match": {
@@ -659,47 +344,11 @@ def employee_monthly(
             }
         }
     ]
-
-    res = list(db.attendance_logs.aggregate(pipeline))
-    if res:
-        agg = res[0]
-        present_days = float(agg["present_days"])
-        leave_days = int(agg["leave_days"])
-        late_count = int(agg["late_count"])
-        total_late = int(agg["total_late_minutes"])
-        total_ot = int(agg["total_overtime_minutes"])
-    else:
-        present_days = 0.0
-        leave_days = 0
-        late_count = 0
-        total_late = 0
-        total_ot = 0
-
-    if working_days > 0:
-        att_pct = round_half_up((present_days / working_days) * 100, 2)
-    else:
-        att_pct = None
-
-    return {
-        "emp_code": emp_code,
-        "month": month,
-        "working_days": working_days,
-        "present_days": present_days,
-        "leave_days": leave_days,
-        "late_count": late_count,
-        "total_late_minutes": total_late,
-        "total_overtime_minutes": total_ot,
-        "attendance_pct": att_pct,
-    }
+    return "attendance_logs", pipeline
 
 
-@app.get("/analytics/departments/summary")
-def department_summary(
-    month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
-    department: Optional[str] = None,
-):
+def build_department_summary_pipeline(month: str, department: Optional[str] = None) -> Tuple[str, List[Dict[str, Any]]]:
     first_day, last_day, _ = get_month_range(month)
-
     match_emp: Dict[str, Any] = {"joined_on": {"$lte": last_day}}
     if department:
         match_emp["department"] = department
@@ -825,7 +474,7 @@ def department_summary(
                 "avg_work_hours": {
                     "$cond": [
                         {"$gt": [{"$size": "$work_hours_list"}, 0]},
-                        {"$round": [{"$avg": "$work_hours_list"}, 2]},
+                        {"$avg": "$work_hours_list"},
                         None
                     ]
                 },
@@ -838,32 +487,11 @@ def department_summary(
         {"$match": {"headcount": {"$gt": 0}}},
         {"$sort": {"department": 1}}
     ]
-
-    raw_items = list(db.employees.aggregate(pipeline))
-    items = []
-    for item in raw_items:
-        items.append({
-            "department": item["department"],
-            "headcount": item["headcount"],
-            "present_days": item["present_days"],
-            "avg_work_hours": round_half_up(item["avg_work_hours"], 2) if item["avg_work_hours"] is not None else None,
-            "late_count": item["late_count"],
-            "total_late_minutes": item["total_late_minutes"],
-            "leave_count": item["leave_count"],
-            "on_duty_count": item["on_duty_count"],
-        })
-
-    return {"month": month, "items": items}
+    return "employees", pipeline
 
 
-@app.get("/analytics/leaderboard/late")
-def late_leaderboard(
-    month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
-    limit: int = Query(10, ge=1, le=50),
-    department: Optional[str] = None,
-):
+def build_late_leaderboard_pipeline(month: str, limit: int = 10, department: Optional[str] = None) -> Tuple[str, List[Dict[str, Any]]]:
     first_day, last_day, _ = get_month_range(month)
-
     pipeline: List[Dict[str, Any]] = [
         {
             "$match": {
@@ -918,30 +546,13 @@ def late_leaderboard(
             }
         }
     ])
-
-    items = list(db.attendance_logs.aggregate(pipeline))
-    return {"month": month, "items": items}
+    return "attendance_logs", pipeline
 
 
-@app.get("/analytics/departments/{department}/trend")
-def department_trend(
-    department: str = Path(...),
-    from_date: str = Query(..., alias="from", pattern=r"^\d{4}-\d{2}-\d{2}$"),
-    to_date: str = Query(..., alias="to", pattern=r"^\d{4}-\d{2}-\d{2}$"),
-):
-    if to_date < from_date:
-        raise HTTPException(status_code=422, detail="to must be >= from")
-
+def build_department_trend_pipeline(department: str, from_date: str, to_date: str) -> Tuple[str, List[Dict[str, Any]]]:
     d_from = date.fromisoformat(from_date)
     d_to = date.fromisoformat(to_date)
-    diff_days = (d_to - d_from).days
-    if diff_days > 92:
-        raise HTTPException(status_code=422, detail="Date range exceeds 92 days")
-
     dept_emps = list(db.employees.find({"department": department}, {"emp_code": 1}))
-    if not dept_emps:
-        raise HTTPException(status_code=404, detail="Department not found")
-
     dept_emp_codes = [e["emp_code"] for e in dept_emps]
     from_dt_utc = datetime.combine(d_from, time.min, tzinfo=timezone.utc)
     to_dt_utc_next = datetime.combine(d_to + timedelta(days=1), time.min, tzinfo=timezone.utc)
@@ -1087,8 +698,443 @@ def department_trend(
         },
         {"$sort": {"date": 1}}
     ]
+    return "attendance_logs", pipeline
 
-    raw_items = list(db.attendance_logs.aggregate(pipeline))
+
+# --------------------------------------------------------------------------- #
+# System Endpoints
+# --------------------------------------------------------------------------- #
+@app.get("/health")
+def health():
+    try:
+        client.admin.command("ping")
+        return {"status": "ok"}
+    except Exception:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+
+# --------------------------------------------------------------------------- #
+# Employee Endpoints
+# --------------------------------------------------------------------------- #
+@app.post("/employees", status_code=201)
+def create_employee(body: EmployeeCreate):
+    now_utc = datetime.now(timezone.utc).replace(microsecond=0)
+    doc = body.model_dump()
+    doc["created_at"] = now_utc
+
+    try:
+        db.employees.insert_one(doc)
+    except pymongo.errors.DuplicateKeyError:
+        raise HTTPException(status_code=409, detail="emp_code already exists")
+
+    return format_employee_doc(doc)
+
+
+@app.get("/employees")
+def list_employees(
+    department: Optional[str] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+):
+    q: Dict[str, Any] = {}
+    if department:
+        q["department"] = department
+
+    total = db.employees.count_documents(q)
+    skip = (page - 1) * page_size
+    cursor = db.employees.find(q).sort("emp_code", pymongo.ASCENDING).skip(skip).limit(page_size)
+    items = [format_employee_doc(d) for d in cursor]
+    return {"items": items, "total": total, "page": page, "page_size": page_size}
+
+
+# --------------------------------------------------------------------------- #
+# Attendance Endpoints
+# --------------------------------------------------------------------------- #
+@app.post("/attendance/punch-in", status_code=201)
+def punch_in(body: PunchInRequest):
+    emp = db.employees.find_one({"emp_code": body.emp_code})
+    if not emp:
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    if body.punched_at is not None:
+        punch_in_utc = ms_to_utc_dt(body.punched_at)
+    else:
+        now_ts = int(datetime.now(timezone.utc).timestamp()) * 1000
+        punch_in_utc = ms_to_utc_dt(now_ts)
+
+    att_date = get_attendance_date(punch_in_utc, emp["shift_start"], emp["shift_end"])
+    late_min = compute_late_minutes(punch_in_utc, emp["shift_start"], att_date)
+
+    doc = {
+        "emp_code": body.emp_code,
+        "date": att_date,
+        "status": body.status,
+        "punch_in": punch_in_utc,
+        "punch_out": None,
+        "work_hours": None,
+        "late_minutes": late_min,
+        "overtime_minutes": 0,
+        "half_day": False,
+        "history": [],
+    }
+
+    try:
+        db.attendance_logs.insert_one(doc)
+    except pymongo.errors.DuplicateKeyError:
+        raise HTTPException(status_code=409, detail="already punched in for this date")
+
+    return format_attendance_doc(doc)
+
+
+@app.post("/attendance/punch-out", status_code=200)
+def punch_out(body: PunchOutRequest):
+    emp = db.employees.find_one({"emp_code": body.emp_code})
+    if not emp:
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    if body.punched_at is not None:
+        punch_out_utc = ms_to_utc_dt(body.punched_at)
+    else:
+        now_ts = int(datetime.now(timezone.utc).timestamp()) * 1000
+        punch_out_utc = ms_to_utc_dt(now_ts)
+
+    # Find the most recent record whose punch_in <= punch_out (not null)
+    open_record = db.attendance_logs.find_one(
+        {"emp_code": body.emp_code, "punch_in": {"$ne": None, "$lte": punch_out_utc}},
+        sort=[("punch_in", pymongo.DESCENDING)]
+    )
+
+    if not open_record:
+        raise HTTPException(status_code=404, detail="No punch-in record found")
+
+    if open_record.get("punch_out") is not None:
+        raise HTTPException(status_code=409, detail="Record is already punched out")
+
+    punch_in_utc = open_record["punch_in"]
+    if punch_in_utc.tzinfo is None:
+        punch_in_utc = punch_in_utc.replace(tzinfo=timezone.utc)
+
+    diff_sec = (punch_out_utc - punch_in_utc).total_seconds()
+    if diff_sec <= 0 or diff_sec > 86400:
+        raise HTTPException(status_code=422, detail="punch_out must be strictly after punch_in and within 24 hours")
+
+    work_hours = compute_work_hours(punch_in_utc, punch_out_utc)
+    half_day = bool(work_hours < 4.50)
+    overtime_min = compute_overtime(punch_out_utc, emp["shift_end"], open_record["date"], emp["shift_start"])
+
+    # Atomic update with concurrency check: punch_out must still be None
+    updated = db.attendance_logs.find_one_and_update(
+        {
+            "_id": open_record["_id"],
+            "punch_out": None
+        },
+        {
+            "$set": {
+                "punch_out": punch_out_utc,
+                "work_hours": work_hours,
+                "overtime_minutes": overtime_min,
+                "half_day": half_day,
+            }
+        },
+        return_document=ReturnDocument.AFTER
+    )
+
+    if not updated:
+        raise HTTPException(status_code=409, detail="Record was concurrently punched out")
+
+    return format_attendance_doc(updated)
+
+
+@app.get("/attendance")
+def list_attendance(
+    emp_code: Optional[str] = None,
+    date_from: Optional[str] = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    date_to: Optional[str] = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    status: Optional[str] = Query(None, pattern=r"^(PRESENT|ABSENT|LEAVE|WFH|ON_DUTY)$"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+):
+    if date_from:
+        try:
+            date.fromisoformat(date_from)
+        except ValueError:
+            raise HTTPException(status_code=422, detail="Invalid date_from")
+    if date_to:
+        try:
+            date.fromisoformat(date_to)
+        except ValueError:
+            raise HTTPException(status_code=422, detail="Invalid date_to")
+
+    if date_from and date_to and date_from > date_to:
+        raise HTTPException(status_code=422, detail="date_from must be <= date_to")
+
+    q: Dict[str, Any] = {}
+    if emp_code:
+        q["emp_code"] = emp_code
+    if date_from or date_to:
+        q["date"] = {}
+        if date_from:
+            q["date"]["$gte"] = date_from
+        if date_to:
+            q["date"]["$lte"] = date_to
+    if status:
+        q["status"] = status
+
+    total = db.attendance_logs.count_documents(q)
+    skip = (page - 1) * page_size
+    cursor = db.attendance_logs.find(q).sort([("date", pymongo.DESCENDING), ("emp_code", pymongo.ASCENDING)]).skip(skip).limit(page_size)
+    items = [format_attendance_doc(d) for d in cursor]
+    return {"items": items, "total": total, "page": page, "page_size": page_size}
+
+
+@app.patch("/attendance/{emp_code}/{date}")
+def regularize_attendance(
+    emp_code: str = Path(...),
+    date_param: str = Path(..., alias="date", pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    body: RegularizeRequest = ...,
+):
+    try:
+        date.fromisoformat(date_param)
+    except ValueError:
+        raise HTTPException(status_code=422, detail="Invalid date in path")
+
+    emp = db.employees.find_one({"emp_code": emp_code})
+    if not emp:
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    record = db.attendance_logs.find_one({"emp_code": emp_code, "date": date_param})
+    if not record:
+        raise HTTPException(status_code=404, detail="Attendance record not found")
+
+    curr_status = record.get("status")
+    curr_in = record.get("punch_in")
+    if curr_in and curr_in.tzinfo is None:
+        curr_in = curr_in.replace(tzinfo=timezone.utc)
+    curr_out = record.get("punch_out")
+    if curr_out and curr_out.tzinfo is None:
+        curr_out = curr_out.replace(tzinfo=timezone.utc)
+    curr_wh = record.get("work_hours")
+    curr_late = record.get("late_minutes", 0)
+    curr_ot = record.get("overtime_minutes", 0)
+    curr_hd = record.get("half_day", False)
+    curr_history = record.get("history") or []
+
+    target_status = body.status if body.status is not None else curr_status
+
+    if target_status in ("ABSENT", "LEAVE"):
+        if body.punch_in is not None or body.punch_out is not None:
+            raise HTTPException(status_code=422, detail="Cannot supply punch times when setting ABSENT or LEAVE")
+        new_in = None
+        new_out = None
+        new_wh = None
+        new_late = 0
+        new_ot = 0
+        new_hd = False
+    else:
+        # Presence status requires punch_in
+        if body.punch_in is not None:
+            new_in = ms_to_utc_dt(body.punch_in)
+        else:
+            new_in = curr_in
+
+        if new_in is None:
+            raise HTTPException(status_code=422, detail="Presence status requires punch_in")
+
+        # R1: punch_in must stay on record's attendance date
+        computed_date = get_attendance_date(new_in, emp["shift_start"], emp["shift_end"])
+        if computed_date != date_param:
+            raise HTTPException(status_code=422, detail="punch_in does not match the attendance date")
+
+        # punch_out
+        if body.punch_out is not None:
+            new_out = ms_to_utc_dt(body.punch_out)
+        else:
+            new_out = curr_out
+
+        if new_out is not None:
+            diff_sec = (new_out - new_in).total_seconds()
+            if diff_sec <= 0 or diff_sec > 86400:
+                raise HTTPException(status_code=422, detail="punch_out must be after punch_in and within 24 hours")
+            new_wh = compute_work_hours(new_in, new_out)
+            new_hd = bool(new_wh < 4.50)
+            new_ot = compute_overtime(new_out, emp["shift_end"], date_param, emp["shift_start"])
+        else:
+            new_wh = None
+            new_hd = False
+            new_ot = 0
+
+        new_late = compute_late_minutes(new_in, emp["shift_start"], date_param)
+
+    # Compute changes
+    changes: Dict[str, Any] = {}
+    if target_status != curr_status:
+        changes["status"] = {"from": curr_status, "to": target_status}
+    if new_in != curr_in:
+        changes["punch_in"] = {"from": curr_in, "to": new_in}
+    if new_out != curr_out:
+        changes["punch_out"] = {"from": curr_out, "to": new_out}
+    if new_wh != curr_wh:
+        changes["work_hours"] = {"from": curr_wh, "to": new_wh}
+    if new_late != curr_late:
+        changes["late_minutes"] = {"from": curr_late, "to": new_late}
+    if new_ot != curr_ot:
+        changes["overtime_minutes"] = {"from": curr_ot, "to": new_ot}
+    if new_hd != curr_hd:
+        changes["half_day"] = {"from": curr_hd, "to": new_hd}
+
+    if not changes:
+        raise HTTPException(status_code=422, detail="No fields changed")
+
+    now_utc = datetime.now(timezone.utc).replace(microsecond=0)
+    history_entry = {
+        "at": now_utc,
+        "by": body.regularized_by,
+        "reason": body.reason,
+        "changes": changes,
+    }
+
+    # Race-safe update matching exact current history size
+    updated = db.attendance_logs.find_one_and_update(
+        {
+            "_id": record["_id"],
+            "history": {"$size": len(curr_history)}
+        },
+        {
+            "$set": {
+                "status": target_status,
+                "punch_in": new_in,
+                "punch_out": new_out,
+                "work_hours": new_wh,
+                "late_minutes": new_late,
+                "overtime_minutes": new_ot,
+                "half_day": new_hd,
+            },
+            "$push": {
+                "history": history_entry
+            }
+        },
+        return_document=ReturnDocument.AFTER
+    )
+
+    if not updated:
+        raise HTTPException(status_code=409, detail="Concurrent regularization conflict")
+
+    return format_attendance_doc(updated)
+
+
+# --------------------------------------------------------------------------- #
+# Analytics Endpoints
+# --------------------------------------------------------------------------- #
+@app.get("/analytics/employees/{emp_code}/monthly")
+def employee_monthly(
+    emp_code: str = Path(...),
+    month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
+):
+    emp = db.employees.find_one({"emp_code": emp_code})
+    if not emp:
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    first_day, last_day, _ = get_month_range(month)
+    joined_on = emp["joined_on"]
+
+    # Working days per R7
+    eff_start = max(first_day, joined_on)
+    working_days = count_working_days(eff_start, last_day)
+
+    collection, pipeline = build_employee_monthly_pipeline(emp_code, month)
+    res = list(db[collection].aggregate(pipeline))
+
+    if res:
+        agg = res[0]
+        present_days = float(agg["present_days"])
+        leave_days = int(agg["leave_days"])
+        late_count = int(agg["late_count"])
+        total_late = int(agg["total_late_minutes"])
+        total_ot = int(agg["total_overtime_minutes"])
+    else:
+        present_days = 0.0
+        leave_days = 0
+        late_count = 0
+        total_late = 0
+        total_ot = 0
+
+    if working_days > 0:
+        att_pct = round_half_up((present_days / working_days) * 100, 2)
+    else:
+        att_pct = None
+
+    return {
+        "emp_code": emp_code,
+        "month": month,
+        "working_days": working_days,
+        "present_days": present_days,
+        "leave_days": leave_days,
+        "late_count": late_count,
+        "total_late_minutes": total_late,
+        "total_overtime_minutes": total_ot,
+        "attendance_pct": att_pct,
+    }
+
+
+@app.get("/analytics/departments/summary")
+def department_summary(
+    month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
+    department: Optional[str] = None,
+):
+    collection, pipeline = build_department_summary_pipeline(month, department)
+    raw_items = list(db[collection].aggregate(pipeline))
+    items = []
+    for item in raw_items:
+        items.append({
+            "department": item["department"],
+            "headcount": item["headcount"],
+            "present_days": item["present_days"],
+            "avg_work_hours": round_half_up(item["avg_work_hours"], 2) if item["avg_work_hours"] is not None else None,
+            "late_count": item["late_count"],
+            "total_late_minutes": item["total_late_minutes"],
+            "leave_count": item["leave_count"],
+            "on_duty_count": item["on_duty_count"],
+        })
+
+    return {"month": month, "items": items}
+
+
+@app.get("/analytics/leaderboard/late")
+def late_leaderboard(
+    month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
+    limit: int = Query(10, ge=1, le=50),
+    department: Optional[str] = None,
+):
+    collection, pipeline = build_late_leaderboard_pipeline(month, limit, department)
+    items = list(db[collection].aggregate(pipeline))
+    return {"month": month, "items": items}
+
+
+@app.get("/analytics/departments/{department}/trend")
+def department_trend(
+    department: str = Path(...),
+    from_date: str = Query(..., alias="from", pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    to_date: str = Query(..., alias="to", pattern=r"^\d{4}-\d{2}-\d{2}$"),
+):
+    try:
+        d_from = date.fromisoformat(from_date)
+        d_to = date.fromisoformat(to_date)
+    except ValueError:
+        raise HTTPException(status_code=422, detail="Invalid from or to date")
+
+    if to_date < from_date:
+        raise HTTPException(status_code=422, detail="to must be >= from")
+
+    diff_days = (d_to - d_from).days
+    if diff_days > 92:
+        raise HTTPException(status_code=422, detail="Date range exceeds 92 days")
+
+    dept_count = db.employees.count_documents({"department": department})
+    if dept_count == 0:
+        raise HTTPException(status_code=404, detail="Department not found")
+
+    collection, pipeline = build_department_trend_pipeline(department, from_date, to_date)
+    raw_items = list(db[collection].aggregate(pipeline))
     items = []
     for r in raw_items:
         rate = round_half_up(r["attendance_rate"], 4) if r["attendance_rate"] is not None else None
@@ -1125,8 +1171,19 @@ def explain_endpoint(
     page_size: int = Query(20, ge=1, le=100),
 ):
     if endpoint == "attendance_list":
+        if date_from:
+            try:
+                date.fromisoformat(date_from)
+            except ValueError:
+                raise HTTPException(status_code=422, detail="Invalid date_from")
+        if date_to:
+            try:
+                date.fromisoformat(date_to)
+            except ValueError:
+                raise HTTPException(status_code=422, detail="Invalid date_to")
         if date_from and date_to and date_from > date_to:
             raise HTTPException(status_code=422, detail="date_from must be <= date_to")
+
         q: Dict[str, Any] = {}
         if emp_code:
             q["emp_code"] = emp_code
@@ -1152,63 +1209,52 @@ def explain_endpoint(
     elif endpoint == "employee_monthly":
         if not emp_code or not month:
             raise HTTPException(status_code=422, detail="emp_code and month are required")
-        first_day, last_day, _ = get_month_range(month)
-        pipeline = [
-            {"$match": {"emp_code": emp_code, "date": {"$gte": first_day, "$lte": last_day}}}
-        ]
+        collection, pipeline = build_employee_monthly_pipeline(emp_code, month)
         explain_res = db.command("explain", {
-            "aggregate": "attendance_logs",
+            "aggregate": collection,
             "pipeline": pipeline,
             "cursor": {}
         }, verbosity="executionStats")
-        return {"endpoint": endpoint, "collection": "attendance_logs", "explain": explain_res}
+        return {"endpoint": endpoint, "collection": collection, "explain": explain_res}
 
     elif endpoint == "department_summary":
         if not month:
             raise HTTPException(status_code=422, detail="month is required")
-        first_day, last_day, _ = get_month_range(month)
-        match_emp: Dict[str, Any] = {"joined_on": {"$lte": last_day}}
-        if department:
-            match_emp["department"] = department
-        pipeline = [
-            {"$match": match_emp}
-        ]
+        collection, pipeline = build_department_summary_pipeline(month, department)
         explain_res = db.command("explain", {
-            "aggregate": "employees",
+            "aggregate": collection,
             "pipeline": pipeline,
             "cursor": {}
         }, verbosity="executionStats")
-        return {"endpoint": endpoint, "collection": "employees", "explain": explain_res}
+        return {"endpoint": endpoint, "collection": collection, "explain": explain_res}
 
     elif endpoint == "late_leaderboard":
         if not month:
             raise HTTPException(status_code=422, detail="month is required")
-        first_day, last_day, _ = get_month_range(month)
-        pipeline = [
-            {"$match": {"date": {"$gte": first_day, "$lte": last_day}, "late_minutes": {"$gt": 0}}}
-        ]
+        collection, pipeline = build_late_leaderboard_pipeline(month, limit, department)
         explain_res = db.command("explain", {
-            "aggregate": "attendance_logs",
+            "aggregate": collection,
             "pipeline": pipeline,
             "cursor": {}
         }, verbosity="executionStats")
-        return {"endpoint": endpoint, "collection": "attendance_logs", "explain": explain_res}
+        return {"endpoint": endpoint, "collection": collection, "explain": explain_res}
 
     elif endpoint == "department_trend":
         if not department or not from_date or not to_date:
             raise HTTPException(status_code=422, detail="department, from, and to are required")
+        try:
+            d_from = date.fromisoformat(from_date)
+            d_to = date.fromisoformat(to_date)
+        except ValueError:
+            raise HTTPException(status_code=422, detail="Invalid from or to date")
         if to_date < from_date:
             raise HTTPException(status_code=422, detail="to must be >= from")
-        dept_emps = list(db.employees.find({"department": department}, {"emp_code": 1}))
-        dept_emp_codes = [e["emp_code"] for e in dept_emps]
-        pipeline = [
-            {"$match": {"emp_code": {"$in": dept_emp_codes}, "date": {"$gte": from_date, "$lte": to_date}}}
-        ]
+        collection, pipeline = build_department_trend_pipeline(department, from_date, to_date)
         explain_res = db.command("explain", {
-            "aggregate": "attendance_logs",
+            "aggregate": collection,
             "pipeline": pipeline,
             "cursor": {}
         }, verbosity="executionStats")
-        return {"endpoint": endpoint, "collection": "attendance_logs", "explain": explain_res}
+        return {"endpoint": endpoint, "collection": collection, "explain": explain_res}
 
     raise HTTPException(status_code=422, detail="Invalid endpoint")

@@ -1,26 +1,55 @@
-# Candidate kit
+# Employee Attendance & Analytics API
 
-Read in this order:
+A high-performance Employee Attendance and Analytics backend service built with Python, FastAPI, and MongoDB.
 
-1. `PROBLEM_STATEMENT.docx`: what you are asked to do, how it is evaluated.
-2. `openapi.yaml`: the API contract and the business rules (R1 - R10).
-3. `DATA_MODEL.md`: what is stored in MongoDB, with nine sample documents.
-4. `app/main.py`: the starter. Put **all** your code in this one file. It must start with `uvicorn app.main:app --port 8000`.
-5. `REVIEW.md`, `DECISIONS.md`: templates to fill in.
+## Features
+- **Accurate Business Rules (R1–R10)**: IST timezone resolution, overnight shift handling, 10-minute grace period with full late minutes calculation, half-up rounding (`ROUND_HALF_UP`) for work hours, overtime calculation with 30-minute threshold, and mid-month joiner working day prorating.
+- **Race-Safe Operations**: Guaranteed concurrency safety for duplicate punch-ins, simultaneous punch-outs, and optimistic concurrency history tracking on manual regularizations.
+- **Advanced MongoDB Aggregation Pipelines**: Pure database-side analytics utilizing cross-collection lookups, window functions (`$setWindowFields`, `$rank`), and date gap filling (`$densify`) with zero Python loops.
+- **Index Optimization**: All primary queries and aggregations are backed by compound indexes created idempotently at startup, verified to use `IXSCAN` with zero `COLLSCAN`.
 
-`sample_data/` holds the nine sample documents as MongoDB Extended JSON; `sample_seed.py` loads them. The grader's dataset is
-much larger and contains cases they do not show.
+## Requirements
+- Python 3.11+
+- MongoDB 6.0+ (Tested against MongoDB 7.0)
 
-## Local setup
-```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env            # set MONGO_URI / MONGO_DB (local docker: docker run -p 27017:27017 mongo:7)
-python sample_seed.py
-uvicorn app.main:app --port 8000 --reload
-```
-MongoDB **6.0 or newer** is required (the grader uses 7.0). MongoDB Atlas free tier (M0) works.
+## Getting Started
 
-## Submit
-A public Git repository with `app/main.py`, `requirements.txt`, `REVIEW.md`, `DECISIONS.md` and a short `README.md`.
-No `.env`, no secrets, no Dockerfile.
+1. **Clone the repository:**
+   ```bash
+   git clone https://github.com/6888mayank/HR1_task-Repo-.git
+   cd HR1_task-Repo-
+   ```
+
+2. **Create and activate a virtual environment:**
+   ```bash
+   python3 -m venv .venv
+   source .venv/bin/activate
+   pip install -r requirements.txt
+   ```
+
+3. **Configure Environment Variables:**
+   Set `MONGO_URI` and `MONGO_DB` (or rely on the defaults `mongodb://localhost:27017` and `attendance_db`):
+   ```bash
+   export MONGO_URI="mongodb://localhost:27017"
+   export MONGO_DB="attendance_db"
+   ```
+
+4. **Seed Sample Data (Optional):**
+   ```bash
+   python sample_seed.py
+   ```
+
+5. **Run the API server:**
+   ```bash
+   uvicorn app.main:app --port 8000 --reload
+   ```
+
+## API Documentation
+Interactive OpenAPI documentation is available at:
+- Swagger UI: `http://localhost:8000/docs`
+- ReDoc: `http://localhost:8000/redoc`
+
+## Structure
+- [app/main.py](app/main.py): Complete API implementation, models, aggregations, and startup index initialization.
+- [REVIEW.md](REVIEW.md): Code review findings and defect resolutions from the starter implementation.
+- [DECISIONS.md](DECISIONS.md): Architectural decisions covering index design, concurrency, tie handling, headcount tracking, and 100x scaling strategy.

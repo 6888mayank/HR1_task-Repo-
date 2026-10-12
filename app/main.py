@@ -35,7 +35,7 @@ def init_indexes():
         try:
             collection.create_index(keys, **kwargs)
         except pymongo.errors.OperationFailure as e:
-            if getattr(e, "code", None) == 86:  # IndexKeySpecsConflict
+            if getattr(e, "code", None) == 86:  # IndexKeySpecsConflict: reconcile existing index specs
                 for idx in collection.list_indexes():
                     if idx.get("key") == dict(keys):
                         collection.drop_index(idx["name"])
@@ -44,12 +44,10 @@ def init_indexes():
             else:
                 raise
 
-    # employees collection
     safe_create_index(db.employees, [("emp_code", pymongo.ASCENDING)], unique=True)
     safe_create_index(db.employees, [("department", pymongo.ASCENDING), ("joined_on", pymongo.ASCENDING)])
     safe_create_index(db.employees, [("joined_on", pymongo.ASCENDING)])
 
-    # attendance_logs collection
     safe_create_index(
         db.attendance_logs,
         [("emp_code", pymongo.ASCENDING), ("date", pymongo.ASCENDING)],
@@ -77,7 +75,7 @@ app = FastAPI(
 # Helper Utilities
 # --------------------------------------------------------------------------- #
 def round_half_up(val: Optional[float | Decimal], places: int = 2) -> Optional[float]:
-    """R8 Rounding: exact half-up rounding (not banker's round-to-even)."""
+    """R8: Exact half-up rounding (eliminating banker's round-to-even bias)."""
     if val is None:
         return None
     d = Decimal(str(val))
@@ -86,7 +84,7 @@ def round_half_up(val: Optional[float | Decimal], places: int = 2) -> Optional[f
 
 
 def truncate_to_seconds(ts_ms: int) -> int:
-    """R1: Truncate epoch milliseconds to whole seconds."""
+    """R1: Truncate epoch milliseconds to whole seconds before calculations."""
     return (ts_ms // 1000) * 1000
 
 
@@ -114,9 +112,8 @@ def is_overnight_shift(shift_start: str, shift_end: str) -> bool:
 
 def get_attendance_date(punch_in_utc: datetime, shift_start: str, shift_end: str) -> str:
     """
-    R1: A record's date is the IST calendar date of its punch_in instant.
-    For overnight shifts: punch-in whose IST time is earlier than shift_end
-    belongs to the shift that started the previous calendar day.
+    R1: Attendance date in IST. For overnight shifts, punch-ins before
+    shift_end belong to the previous calendar day's shift.
     """
     punch_ist = punch_in_utc.astimezone(IST)
     if is_overnight_shift(shift_start, shift_end):
@@ -129,8 +126,8 @@ def get_attendance_date(punch_in_utc: datetime, shift_start: str, shift_end: str
 
 def compute_late_minutes(punch_in_utc: datetime, shift_start: str, record_date_str: str) -> int:
     """
-    R2: Grace period 10 minutes. Late only if punch-in is strictly more than 10:00
-    after shift_start; then late_minutes = whole minutes (floor) since shift_start.
+    R2: 10m grace period. Late only if punch-in > 10:00 after shift_start;
+    late_minutes = floor elapsed minutes since shift_start.
     """
     punch_ist = punch_in_utc.astimezone(IST)
     rec_date = date.fromisoformat(record_date_str)
@@ -143,7 +140,7 @@ def compute_late_minutes(punch_in_utc: datetime, shift_start: str, record_date_s
 
 
 def compute_work_hours(punch_in_utc: datetime, punch_out_utc: datetime) -> float:
-    """R4: (punch_out - punch_in) in seconds / 3600, rounded to 2 decimals half-up."""
+    """R4: Elapsed hours rounded to 2 decimals half-up."""
     diff_sec = (punch_out_utc - punch_in_utc).total_seconds()
     hours_dec = Decimal(str(diff_sec)) / Decimal("3600")
     return round_half_up(hours_dec, 2)
@@ -156,7 +153,7 @@ def compute_overtime(
     shift_start: str
 ) -> int:
     """
-    R3: Whole minutes (floor) from shift_end to punch_out, counted only if >= 30; otherwise 0.
+    R3: Whole minutes from shift_end to punch_out if >= 30; otherwise 0.
     For overnight shifts, shift_end falls on the next calendar day.
     """
     punch_ist = punch_out_utc.astimezone(IST)
@@ -263,7 +260,7 @@ class RegularizeRequest(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
-# Shared Aggregation Pipeline Builders (DRY for endpoints & explain)
+# Shared Aggregation Pipeline Builders
 # --------------------------------------------------------------------------- #
 def get_month_range(month_str: str) -> Tuple[str, str, int]:
     """Return (first_day, last_day, days_in_month)."""
@@ -290,6 +287,7 @@ def count_working_days(start_date_str: str, end_date_str: str) -> int:
 
 
 def build_employee_monthly_pipeline(emp_code: str, month: str) -> Tuple[str, List[Dict[str, Any]]]:
+    """Build aggregation pipeline for monthly employee attendance summary (R5–R7)."""
     first_day, last_day, _ = get_month_range(month)
     pipeline = [
         {
@@ -313,7 +311,7 @@ def build_employee_monthly_pipeline(emp_code: str, month: str) -> Tuple[str, Lis
         },
         {
             "$project": {
-                "is_mon_fri": {"$in": ["$day_of_week", [2, 3, 4, 5, 6]]},
+                "is_mon_fri": {"$in": ["$day_of_week", [2, 3, 4, 5, 6]]},  # Mongo $dayOfWeek: 2=Mon..6=Fri
                 "is_presence": {"$in": ["$status", ["PRESENT", "WFH", "ON_DUTY"]]},
                 "is_leave": {"$eq": ["$status", "LEAVE"]},
                 "late_minutes": 1,
@@ -348,6 +346,7 @@ def build_employee_monthly_pipeline(emp_code: str, month: str) -> Tuple[str, Lis
 
 
 def build_department_summary_pipeline(month: str, department: Optional[str] = None) -> Tuple[str, List[Dict[str, Any]]]:
+    """Build cross-collection pipeline starting from employees to preserve headcount (R9)."""
     first_day, last_day, _ = get_month_range(month)
     match_emp: Dict[str, Any] = {"joined_on": {"$lte": last_day}}
     if department:
@@ -491,6 +490,7 @@ def build_department_summary_pipeline(month: str, department: Optional[str] = No
 
 
 def build_late_leaderboard_pipeline(month: str, limit: int = 10, department: Optional[str] = None) -> Tuple[str, List[Dict[str, Any]]]:
+    """Build pipeline ranking late employees using window functions with ties (1, 2, 2, 4)."""
     first_day, last_day, _ = get_month_range(month)
     pipeline: List[Dict[str, Any]] = [
         {
@@ -550,6 +550,7 @@ def build_late_leaderboard_pipeline(month: str, limit: int = 10, department: Opt
 
 
 def build_department_trend_pipeline(department: str, from_date: str, to_date: str) -> Tuple[str, List[Dict[str, Any]]]:
+    """Build pipeline for daily trend series using $densify gap-filling and moving average."""
     d_from = date.fromisoformat(from_date)
     d_to = date.fromisoformat(to_date)
     dept_emps = list(db.employees.find({"department": department}, {"emp_code": 1}))
@@ -798,7 +799,7 @@ def punch_out(body: PunchOutRequest):
         now_ts = int(datetime.now(timezone.utc).timestamp()) * 1000
         punch_out_utc = ms_to_utc_dt(now_ts)
 
-    # Find the most recent record whose punch_in <= punch_out (not null)
+    # Find most recent open record whose punch_in is at or before punch_out
     open_record = db.attendance_logs.find_one(
         {"emp_code": body.emp_code, "punch_in": {"$ne": None, "$lte": punch_out_utc}},
         sort=[("punch_in", pymongo.DESCENDING)]
@@ -822,7 +823,7 @@ def punch_out(body: PunchOutRequest):
     half_day = bool(work_hours < 4.50)
     overtime_min = compute_overtime(punch_out_utc, emp["shift_end"], open_record["date"], emp["shift_start"])
 
-    # Atomic update with concurrency check: punch_out must still be None
+    # Atomic update ensuring punch_out is still None (concurrency safe)
     updated = db.attendance_logs.find_one_and_update(
         {
             "_id": open_record["_id"],
@@ -945,7 +946,6 @@ def regularize_attendance(
         if computed_date != date_param:
             raise HTTPException(status_code=422, detail="punch_in does not match the attendance date")
 
-        # punch_out
         if body.punch_out is not None:
             new_out = ms_to_utc_dt(body.punch_out)
         else:
@@ -965,7 +965,7 @@ def regularize_attendance(
 
         new_late = compute_late_minutes(new_in, emp["shift_start"], date_param)
 
-    # Compute changes
+    # Track only fields that actually changed
     changes: Dict[str, Any] = {}
     if target_status != curr_status:
         changes["status"] = {"from": curr_status, "to": target_status}
@@ -993,7 +993,7 @@ def regularize_attendance(
         "changes": changes,
     }
 
-    # Race-safe update matching exact current history size
+    # Optimistic concurrency check: match current history length
     updated = db.attendance_logs.find_one_and_update(
         {
             "_id": record["_id"],
@@ -1037,7 +1037,7 @@ def employee_monthly(
     first_day, last_day, _ = get_month_range(month)
     joined_on = emp["joined_on"]
 
-    # Working days per R7
+    # R7: Working days prorated from joined_on for mid-month joiners
     eff_start = max(first_day, joined_on)
     working_days = count_working_days(eff_start, last_day)
 
